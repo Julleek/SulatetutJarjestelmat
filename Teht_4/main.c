@@ -1,4 +1,4 @@
-//Yhden pisteen tehtävät tehty
+//Tehty 3p edestä tehtävät debug tila ja debug task
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
@@ -6,9 +6,14 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/timing/timing.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
 
-#define STACKSIZE 500
+#define STACKSIZE 1024
 #define PRIORITY 5
+#define DEBUG_PRIORITY 6
 
 K_MUTEX_DEFINE(red_mutex);
 K_CONDVAR_DEFINE(red_signal);
@@ -27,13 +32,15 @@ void yellow_led_task(void *, void *, void*);
 void green_led_task(void *, void *, void*);
 void dispatcher_task(void *, void *, void*);
 void uart_task(void *, void *, void*);
-
+void debug_task(void *, void *, void*);
 
 K_THREAD_DEFINE(dis_thread,STACKSIZE,dispatcher_task,NULL,NULL,NULL,PRIORITY,0,0);
 K_THREAD_DEFINE(uart_thread,STACKSIZE,uart_task,NULL,NULL,NULL,PRIORITY,0,0);
 K_THREAD_DEFINE(red_thread,STACKSIZE,red_led_task,NULL,NULL,NULL,PRIORITY,0,0);
 K_THREAD_DEFINE(yellow_thread,STACKSIZE,yellow_led_task,NULL,NULL,NULL,PRIORITY,0,0);
 K_THREAD_DEFINE(green_thread,STACKSIZE,green_led_task,NULL,NULL,NULL,PRIORITY,0,0);
+// LISÄTTY: debug-taski
+K_THREAD_DEFINE(debug_thread,STACKSIZE,debug_task,NULL,NULL,NULL,DEBUG_PRIORITY,0,0);
 
 #define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
@@ -45,58 +52,80 @@ struct data_t {
 	char msg[20];
 };
 
+struct debug_data_t {
+	void *fifo_reserved;
+	int64_t time;
+    const char *source;
+};
+K_FIFO_DEFINE(data_fifo);
+
+
+static volatile bool debug_on = true;
+
+
+void debug_task(void *a, void *b, void *c)
+{
+    struct debug_data_t *received;
+
+    while (1) {
+        received = k_fifo_get(&data_fifo, K_FOREVER);
+        printk("Debug [%s]: %lld us\n", received->source, received->time);
+        k_free(received);
+
+        k_yield();
+    }
+}
+
 int init_led() {
     int ret;
     ret = gpio_pin_configure_dt(&red, GPIO_OUTPUT_ACTIVE);
     if (ret < 0) {
-        printk("Error: Led configure failed\n");        
-        return ret;
+        return ret; 
     }
 
     ret = gpio_pin_configure_dt(&green, GPIO_OUTPUT_ACTIVE);
     if (ret < 0) {
-        printk("Error: Led configure failed\n");        
         return ret;
     }
     gpio_pin_set_dt(&red,0);
     gpio_pin_set_dt(&green,0);
-
-    printk("Led initialized ok\n");
-    return 0;
+    return 0; 
 }
 
 int init_uart(void) {
-	// UART initialization
 	if (!device_is_ready(uart_dev)) {
 		return 1;
-	} 
+	}
 	return 0;
 }
 
 int main(void)
 {
-
     timing_init();
-    timing_start();
-	timing_t start_time = timing_counter_get();
+    timing_start();  
+    timing_t start_time = timing_counter_get();
 
     init_led();
-	int ret = init_uart();
-	if (ret != 0) {
-		printk("UART initialization failed!\n");
-		return ret;
-	}
+    int ret = init_uart();
+    if (ret != 0) {
+        return ret;   
+    }
 
     timing_t end_time = timing_counter_get();
-    timing_stop();
     uint64_t timing_ns = timing_cycles_to_ns(timing_cycles_get(&start_time, &end_time));
-    printk("Initialization: %llu us\n", timing_ns / 1000);
+
+    struct debug_data_t *buf = k_malloc(sizeof(struct debug_data_t));
+    if (buf != NULL) {
+        buf->source = "Main init";
+        buf->time = timing_ns / 1000;
+        k_fifo_put(&data_fifo, buf);
+    }
 
     while (true){
         k_msleep(100);
     }
 
-	return 0;
+    return 0;
 }
 
 void uart_task(void *, void *, void *)
@@ -107,25 +136,18 @@ void uart_task(void *, void *, void *)
 	int uart_msg_cnt = 0;
 
 	while (true) {
-		// Ask UART if data available
 		if (uart_poll_in(uart_dev,&rc) == 0) {
-			// printk("Received: %c\n",rc);
-			// If character is not newline, add to UART message buffer
-			if (rc != '\r') {
-				uart_msg[uart_msg_cnt] = rc;
-				uart_msg_cnt++;
-			// Character is newline, copy dispatcher data and put to FIFO buffer
-			} else {
-				printk("UART msg: %s\n", uart_msg);
-                
-				struct data_t *buf = k_malloc(sizeof(struct data_t));
-				if (buf == NULL) {
-					return;
+			if (rc != '\r' && rc != '\n') {
+				if (uart_msg_cnt < sizeof(uart_msg) - 1) {
+					uart_msg[uart_msg_cnt] = rc;
+					uart_msg_cnt++;
 				}
-                                snprintf(buf->msg,20,"%s", uart_msg);
-
-                                k_fifo_put(&dispatcher_fifo, buf);
-				// Clear UART message buffer
+			} else if (uart_msg_cnt > 0) {
+				struct data_t *buf = k_malloc(sizeof(struct data_t));
+				if (buf != NULL) {
+					snprintf(buf->msg,20,"%s", uart_msg);
+					k_fifo_put(&dispatcher_fifo, buf);
+				}
 				uart_msg_cnt = 0;
 				memset(uart_msg,0,20);
 			}
@@ -134,19 +156,18 @@ void uart_task(void *, void *, void *)
 	}
 }
 
-
 void dispatcher_task(void *, void *, void *)
 {
     while (true) {
         struct data_t *rec_item = k_fifo_get(&dispatcher_fifo, K_FOREVER);
         char sequence[20];
         memcpy(sequence, rec_item->msg, sizeof(sequence));
+        sequence[19] = '\0';
         k_free(rec_item);
 
-        printk("Dispatcher: %s\n", sequence);
 
-        timing_start();
         timing_t start_time = timing_counter_get();
+        int steps = 0;   
         for (int cnt = 0; sequence[cnt] != 0; cnt++) {
             switch (sequence[cnt]) {
             case 'R':
@@ -164,39 +185,55 @@ void dispatcher_task(void *, void *, void *)
                 k_condvar_broadcast(&green_signal);
                 k_mutex_unlock(&green_mutex);
                 break;
+            case 'D':
+                debug_on = !debug_on;
+                continue;  
             default:
                 continue;
             }
+            steps++;
             k_mutex_lock(&release_mutex, K_FOREVER);
             k_condvar_wait(&release_signal, &release_mutex, K_FOREVER);
             k_mutex_unlock(&release_mutex);
         }
         timing_t end_time = timing_counter_get();
-        timing_stop();
         uint64_t timing_ns = timing_cycles_to_ns(timing_cycles_get(&start_time, &end_time));
-        printk("Sequence time (total): %llu us\n", timing_ns / 1000);
+
+        if (steps > 0 && debug_on) {
+            struct debug_data_t *buf = k_malloc(sizeof(struct debug_data_t));
+            if (buf != NULL) {
+                buf->source = "Dispatcher";
+                buf->time = timing_ns / 1000;
+                k_fifo_put(&data_fifo, buf);
+            }
+        }
     }
 }
 
 //Ledi taskit
 void red_led_task(void *, void *, void *) {
-    printk("Red led thread started\n");
     while (true) {
         k_mutex_lock(&red_mutex, K_FOREVER);
         k_condvar_wait(&red_signal, &red_mutex, K_FOREVER);
         k_mutex_unlock(&red_mutex);
 
-        timing_start();
-	    timing_t red_start_time = timing_counter_get();
+        timing_t red_start_time = timing_counter_get();
 
         gpio_pin_set_dt(&red, 1);
         k_sleep(K_SECONDS(1));
         gpio_pin_set_dt(&red, 0);
 
         timing_t red_end_time = timing_counter_get();
-		timing_stop();
-    	uint64_t timing_ns = timing_cycles_to_ns(timing_cycles_get(&red_start_time, &red_end_time));
-		//printk("Red task: %llu us\n", timing_ns / 1000);
+        uint64_t timing_ns = timing_cycles_to_ns(timing_cycles_get(&red_start_time, &red_end_time));
+
+        if (debug_on) {
+            struct debug_data_t *buf = k_malloc(sizeof(struct debug_data_t));
+            if (buf != NULL) {
+                buf->source = "Red LED";
+                buf->time = timing_ns / 1000;
+                k_fifo_put(&data_fifo, buf);
+            }
+        }
 
         k_mutex_lock(&release_mutex, K_FOREVER);
         k_condvar_broadcast(&release_signal);
@@ -205,13 +242,11 @@ void red_led_task(void *, void *, void *) {
 }
 
 void yellow_led_task(void *, void *, void *) {
-    printk("Yellow led thread started\n");
     while (true) {
         k_mutex_lock(&yellow_mutex, K_FOREVER);
         k_condvar_wait(&yellow_signal, &yellow_mutex, K_FOREVER);
         k_mutex_unlock(&yellow_mutex);
 
-        timing_start();
         timing_t yellow_start_time = timing_counter_get();
 
         gpio_pin_set_dt(&green, 1);
@@ -221,9 +256,16 @@ void yellow_led_task(void *, void *, void *) {
         gpio_pin_set_dt(&red, 0);
 
         timing_t yellow_end_time = timing_counter_get();
-        timing_stop();
         uint64_t timing_ns = timing_cycles_to_ns(timing_cycles_get(&yellow_start_time, &yellow_end_time));
-        //printk("Yellow task: %llu us\n", timing_ns / 1000);
+
+        if (debug_on) {
+            struct debug_data_t *buf = k_malloc(sizeof(struct debug_data_t));
+            if (buf != NULL) {
+                buf->source = "Yellow LED";
+                buf->time = timing_ns / 1000;
+                k_fifo_put(&data_fifo, buf);
+            }
+        }
 
         k_mutex_lock(&release_mutex, K_FOREVER);
         k_condvar_broadcast(&release_signal);
@@ -232,13 +274,11 @@ void yellow_led_task(void *, void *, void *) {
 }
 
 void green_led_task(void *, void *, void *) {
-    printk("Green led thread started\n");
     while (true) {
         k_mutex_lock(&green_mutex, K_FOREVER);
         k_condvar_wait(&green_signal, &green_mutex, K_FOREVER);
         k_mutex_unlock(&green_mutex);
 
-        timing_start();
         timing_t green_start_time = timing_counter_get();
 
         gpio_pin_set_dt(&green, 1);
@@ -246,9 +286,16 @@ void green_led_task(void *, void *, void *) {
         gpio_pin_set_dt(&green, 0);
 
         timing_t green_end_time = timing_counter_get();
-        timing_stop();
         uint64_t timing_ns = timing_cycles_to_ns(timing_cycles_get(&green_start_time, &green_end_time));
-        //printk("Green task: %llu us\n", timing_ns / 1000);
+
+        if (debug_on) {
+            struct debug_data_t *buf = k_malloc(sizeof(struct debug_data_t));
+            if (buf != NULL) {
+                buf->source = "Green LED";
+                buf->time = timing_ns / 1000;
+                k_fifo_put(&data_fifo, buf);
+            }
+        }
 
         k_mutex_lock(&release_mutex, K_FOREVER);
         k_condvar_broadcast(&release_signal);
